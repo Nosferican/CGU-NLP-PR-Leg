@@ -1,0 +1,126 @@
+# Objective
+
+Create a database for legislative voting records for the Puerto Rico legislature.
+
+Similar projects include [GovTrack](https://www.govtrack.us/) and [OpenStates](https://openstates.org/)
+
+# Data and Context
+
+Puerto Rico has a bicameral legislature. We would like to obtain the voting records in the
+lower and upper chambers for recent sessions.
+
+The record keeping is held by each chamber and the office for legislative services:
+
+- [Oficina de Servicios Legislativos](http://www.oslpr.org/buscar/)
+  - Record is a PDF (image)
+  - Website uses Javascript/IFrame
+  - No canonical resource syntax
+  - Example: [2013 - 2016 P C0003 Final Vote in Lower House](http://www.oslpr.org/2013-2016/%7B7F062C61-27CD-433F-B601-73B4A9306ECE%7D.pdf)
+- [Lower House](http://www.tucamarapr.org/)
+  - Record is an HTML table
+  - Website uses ASPX
+  - Canonical url builder, but no canonical resource locator
+  - Example: [2013 - 2016 P C0003 Final Vote in Lower House](http://www.tucamarapr.org/dnncamara/web/actividadlegislativa/votaciones.aspx?measureid=53600&voteid=447)
+- [Upper House](https://senado.pr.gov/)
+  - Two ways of obtaining record
+    - Proceedings
+      - Record is a PDF (not dedicated)
+      - Information as text
+    - Flash Application
+      - Record is a PDF (formatted)
+
+# We'll collect Senate Votes two ways
+
+## From App
+
+```julia
+using Pkg; activate(".")
+```
+
+```julia
+using Cascadia, Dates, DataFrames, Gumbo, HTTP, PDFIO
+```
+
+# Constants
+```julia
+const abbreviations = ("P. de la C." => "P C",
+                       "P. del S." => "P S",
+                       "R. de la C." => "R C",
+                       "R. del S." => "R S",
+                       "R. C. de la C." => "RCC",
+                       "R. C. del S." => "RCS",
+                       "R. C. de la C." => "RCC",
+                       "R. C. del S." => "RCS",
+                       "R. Conc. de la C." => "RKC",
+                       "R. Conc. del S." => "RKS",
+                       "Nombramiento" => "N S",
+                       "PC" => "P C",
+                       "PS" => "P S",
+                       "S. R." => "R S")
+const dividers = reduce((x, y) -> "$x|$y", string.("(", last.(abreviaciones), ")")) |>
+  (x -> Regex("\\s(?=($x))"))
+const spanishmonths = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+                       "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+```
+
+```julia
+function download_senate_precedings()
+  request = HTTP.get("https://www.senado.pr.gov/Pages/Actas-del-Senado.aspx")
+  @assert request.status == 200 "Request did not yield OK"
+  body = String(request.body)
+  html = parsehtml(body)
+  table = eachmatch(Selector("tbody"), html.root)[1]
+  mdy = dateformat"m/d/y"
+  for row ∈ table.children
+    date = Date(nodeText(row[4]), mdy)
+    if Date(2019, 1, 1) ≤ date < Date(2019, 2, 1)
+      href = replace(getattr(row[1][2], "href"), " " => "%20")
+      download("https://www.senado.pr.gov$href",
+               joinpath(dirname(@__DIR__), "data", "raw", "upper",
+                        "proceedings", "$date.pdf"))
+    end
+  end
+end
+```
+
+```julia
+function parse_vote_record(lines)
+  type = abbreviations[findfirst(x -> occursin(x[1], lines[3]), abbreviations)][2]
+  num = parse(Int, match(r"\d+", lines[3]).match)
+  date = match(r"\d+ de \w+ de \d{4}", lines[4]).match |>
+    (date -> Date(parse(Int, date[end - 4:end]),
+                  findfirst(isequal(match(r"(?<=de )\w+(?= de)", date).match),
+                            spanishmonths),
+                  parse(Int, match(r"^\d+", date).match)))
+  votes = strip.(lines[findfirst(x -> occursin("Votante", x), lines) + 1:end - 1])
+  data = DataFrame(split(vote, r"\s{2,}") |>
+                   (legid_vote -> (legid = legid_vote[1],
+                                   vote = legid_vote[2]))
+                    for vote ∈ votes)
+  data.type = type
+  data.number = num
+  data.date = date
+  data[[:type,:number,:legid,:vote]]
+end
+function vote_record(pdf)
+  doc = pdDocOpen(pdf)
+  output = DataFrame([String,Int,String,String], [:type,:number,:legid,:vote], 0)
+  for i ∈ 1:pdDocGetPageCount(doc)
+    pdDocGetPage(doc, i) |>
+    (page -> pdPageExtractText(IOBuffer(append = true), page)) |>
+    (io -> readlines(io)) |>
+    parse_vote_record |>
+    (table -> append!(output, table))
+  end
+  pdDocClose(doc)
+end
+```
+
+## Proceedings (Fill In)
+
+```julia
+pdf = pdDocOpen("data/raw/upper/proceedings/2019-01-14.pdf")
+lines = pdDocGetPage(pdf, 1) |>
+  (x -> pdPageExtractText(IOBuffer(append = true), x)) |>
+  readlines
+```
